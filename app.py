@@ -1,4 +1,3 @@
-import os
 import json
 import sqlite3
 from datetime import datetime
@@ -10,8 +9,8 @@ import yfinance as yf
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="Valoración Internacional", layout="wide")
-st.title("Valoración de Acciones - Arquitectura internacional")
-st.caption("Finnhub como fuente principal de perfil, peers y series internacionales; Yahoo Finance como apoyo para precio histórico y validación.")
+st.title("Valoración de Acciones - Arquitectura internacional optimizada")
+st.caption("Finnhub para perfil y peers; Yahoo Finance como apoyo histórico con caché y menor consumo de API.")
 
 DB_PATH = "valuation_cache_intl.db"
 FINNHUB_BASE = "https://finnhub.io/api/v1"
@@ -87,7 +86,7 @@ def get_peers(symbol, token):
     if cached:
         return cached
     payload = finnhub_get('stock/peers', {'symbol': symbol}, token)
-    peers = [p for p in payload if isinstance(p, str) and p != symbol][:8]
+    peers = [p for p in payload if isinstance(p, str) and p != symbol][:4]
     cache_peers(symbol, peers)
     return peers
 
@@ -112,9 +111,16 @@ def mean_growth_last_years(series, years=4):
     return float(g.tail(min(years, len(g))).mean())
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def yahoo_pack(symbol):
     tk = yf.Ticker(symbol)
-    return {'info': tk.info, 'financials': tk.financials.copy(), 'cashflow': tk.cashflow.copy(), 'balance_sheet': tk.balance_sheet.copy(), 'history': tk.history(period='max', interval='1d', auto_adjust=False)}
+    return {
+        'info': tk.info,
+        'financials': tk.financials.copy(),
+        'cashflow': tk.cashflow.copy(),
+        'balance_sheet': tk.balance_sheet.copy(),
+        'history': tk.history(period='max', interval='1d', auto_adjust=False)
+    }
 
 
 def extract_metrics(ydata):
@@ -126,9 +132,10 @@ def extract_metrics(ydata):
     common = ocf.index.intersection(capex.index)
     fcf = ocf[common] + capex[common] if len(common) else pd.Series(dtype=float)
     base_fcf = float(fcf.tail(2).mean()) if len(fcf) >= 2 else (float(fcf.iloc[-1]) if len(fcf) else np.nan)
+    growth_sales = mean_growth_last_years(revenue, 4)
     growth_real = mean_growth_last_years(net_income, 4)
     if not np.isfinite(growth_real):
-        growth_real = mean_growth_last_years(revenue, 4)
+        growth_real = growth_sales
     if not np.isfinite(growth_real):
         growth_real = 0.05
     growth_base = min(max(growth_real, 0.04), 0.20)
@@ -137,7 +144,19 @@ def extract_metrics(ydata):
     for k in ['Cash And Cash Equivalents', 'Cash Cash Equivalents And Short Term Investments', 'Other Short Term Investments']:
         if k in bs.index and len(bs.loc[k].dropna()):
             cash += float(bs.loc[k].dropna().iloc[0])
-    return {'price': info.get('currentPrice', info.get('regularMarketPrice', np.nan)), 'shares': info.get('sharesOutstanding', np.nan), 'revenue': revenue, 'net_income': net_income, 'base_fcf': base_fcf, 'growth_real': growth_real, 'growth_base': growth_base, 'debt': debt, 'cash': cash, 'forward_pe': info.get('forwardPE', np.nan)}
+    return {
+        'price': info.get('currentPrice', info.get('regularMarketPrice', np.nan)),
+        'shares': info.get('sharesOutstanding', np.nan),
+        'revenue': revenue,
+        'net_income': net_income,
+        'base_fcf': base_fcf,
+        'growth_sales': growth_sales,
+        'growth_real': growth_real,
+        'growth_base': growth_base,
+        'debt': debt,
+        'cash': cash,
+        'forward_pe': info.get('forwardPE', np.nan)
+    }
 
 
 def dcf_intrinsic_from_base(base_fcf, growth_rate, shares, cash, debt, wacc=0.075, term_growth=0.03):
@@ -171,7 +190,7 @@ def intrinsic_path(base_fcf, growth_rate, shares, cash, debt, years=5):
     return pd.Series(vals)
 
 
-def historical_pe_series(financials, history):
+def historical_pe_series(financials, history, max_years=10):
     eps = pick_row(financials, ['Diluted EPS', 'Basic EPS', 'EPS Diluted', 'EPS Basic'])
     if eps.empty or history.empty:
         return pd.Series(dtype=float)
@@ -185,50 +204,60 @@ def historical_pe_series(financials, history):
         p = px_by_year.loc[y]
         if pd.notna(e) and e != 0 and pd.notna(p):
             out[y] = p / e
-    return pd.Series(out).sort_index().tail(5)
+    s = pd.Series(out).sort_index()
+    return s.tail(max_years)
 
 
-def cache_growth_proxy(anchor_symbol, peer_symbol, metric, year, value):
-    conn = get_conn()
-    conn.execute('INSERT OR REPLACE INTO sector_growth_proxy(anchor_symbol, peer_symbol, metric, year, value, updated_at) VALUES (?, ?, ?, ?, ?, ?)', (anchor_symbol, peer_symbol, metric, str(year), float(value), datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+def metrics_table_from_2020(ydata):
+    inc = ydata['financials']
+    cf = ydata['cashflow']
+    bs = ydata['balance_sheet']
+    info = ydata['info']
 
+    ebitda = pick_row(inc, ['Ebitda', 'EBITDA'])
+    net_income = pick_row(inc, ['Net Income'])
+    revenue = pick_row(inc, ['Total Revenue', 'Operating Revenue'])
+    eps = pick_row(inc, ['Diluted EPS', 'Basic EPS', 'EPS Diluted', 'EPS Basic'])
+    fcf_serie = pick_row(cf, ['Free Cash Flow'])
+    if fcf_serie.empty:
+        ocf = pick_row(cf, ['Operating Cash Flow'])
+        capex = -np.abs(pick_row(cf, ['Capital Expenditure', 'Capital Expenditures']))
+        common = ocf.index.intersection(capex.index)
+        fcf_serie = ocf[common] + capex[common] if len(common) else pd.Series(dtype=float)
 
-def load_growth_proxy(anchor_symbol, metric):
-    conn = get_conn()
-    df = pd.read_sql_query('SELECT peer_symbol, year, value FROM sector_growth_proxy WHERE anchor_symbol=? AND metric=? ORDER BY year', conn, params=(anchor_symbol, metric))
-    conn.close()
-    return df
+    total_assets = pick_row(bs, ['Total Assets'])
+    total_liab = pick_row(bs, ['Total Liab', 'Total Liabilities Net Minority Interest'])
+    invested_capital = None
+    if not total_assets.empty and not total_liab.empty:
+        common_bs = total_assets.index.intersection(total_liab.index)
+        invested_capital = total_assets[common_bs] - total_liab[common_bs]
 
+    shares = info.get('sharesOutstanding', np.nan)
 
-def peer_growth_series(anchor_symbol, peers):
-    cached = load_growth_proxy(anchor_symbol, 'revenue_growth')
-    if not cached.empty:
-        return cached
     rows = []
-    for peer in peers[:6]:
-        try:
-            yd = yahoo_pack(peer)
-            rev = pick_row(yd['financials'], ['Total Revenue', 'Operating Revenue']).tail(5)
-            if len(rev) >= 2:
-                g = rev.pct_change().dropna()
-                for idx, val in g.items():
-                    year = idx.year if hasattr(idx, 'year') else str(idx)
-                    cache_growth_proxy(anchor_symbol, peer, 'revenue_growth', year, val)
-                    rows.append({'peer_symbol': peer, 'year': str(year), 'value': float(val)})
-        except Exception:
-            pass
-    return pd.DataFrame(rows)
+    current_year = datetime.now().year
+    for year in range(2020, current_year + 1):
+        row = {'Year': year, 'ROIC_%': np.nan, 'EBITDA_margin_%': np.nan, 'EPS': np.nan, 'Shares': np.nan, 'FCF': np.nan}
+        if year in revenue.index.year and year in ebitda.index.year:
+            e = float(ebitda[ebitda.index.year == year].iloc[-1])
+            r = float(revenue[revenue.index.year == year].iloc[-1])
+            if r != 0:
+                row['EBITDA_margin_%'] = e / r * 100
+        if invested_capital is not None and year in invested_capital.index.year and year in net_income.index.year:
+            ic = float(invested_capital[invested_capital.index.year == year].iloc[-1])
+            ni = float(net_income[net_income.index.year == year].iloc[-1])
+            if ic != 0:
+                row['ROIC_%'] = ni / ic * 100
+        if year in eps.index.year:
+            row['EPS'] = float(eps[eps.index.year == year].iloc[-1])
+        if np.isfinite(shares):
+            row['Shares'] = float(shares)
+        if year in fcf_serie.index.year:
+            row['FCF'] = float(fcf_serie[fcf_serie.index.year == year].iloc[-1])
+        rows.append(row)
 
-
-def aggregate_peer_growth(anchor_symbol, peers):
-    df = peer_growth_series(anchor_symbol, peers)
-    if df.empty:
-        return pd.Series(dtype=float)
-    agg = df.groupby('year')['value'].median().sort_index()
-    agg.index = agg.index.astype(str)
-    return agg
+    df = pd.DataFrame(rows).set_index('Year')
+    return df
 
 
 def run_diagnostics(token, tickers=TEST_TICKERS):
@@ -240,15 +269,13 @@ def run_diagnostics(token, tickers=TEST_TICKERS):
             peers = get_peers(symbol, token)
             ydata = yahoo_pack(symbol)
             metrics = extract_metrics(ydata)
-            pe_hist = historical_pe_series(ydata['financials'], ydata['history'])
-            peer_growth = aggregate_peer_growth(symbol, peers)
+            pe_hist = historical_pe_series(ydata['financials'], ydata['history'], max_years=10)
             base_path = intrinsic_path(metrics['base_fcf'], metrics['growth_base'], metrics['shares'], metrics['cash'], metrics['debt'])
             result.update({
                 'profile_ok': bool(profile.get('name') or profile.get('finnhubIndustry')),
                 'peers_ok': len(peers) > 0,
                 'financials_ok': len(metrics['revenue']) > 0,
                 'pe_hist_points': len(pe_hist),
-                'peer_growth_points': len(peer_growth),
                 'valuation_ok': bool(np.isfinite(dcf_intrinsic_from_base(metrics['base_fcf'], metrics['growth_base'], metrics['shares'], metrics['cash'], metrics['debt']))),
                 'path_points': len(base_path),
                 'status': 'OK'
@@ -263,6 +290,7 @@ finnhub_token = get_secret_or_input('FINNHUB_API_KEY', 'Finnhub API Key')
 ticker = st.sidebar.text_input('Ticker', 'AAPL').upper().strip()
 custom_growth = st.sidebar.number_input('Crecimiento personalizado (%)', 0.0, 100.0, 10.0, 0.5) / 100.0
 pess_cut = st.sidebar.slider('Recorte escenario pesimista (%)', 10, 90, 50) / 100.0
+per_years = st.sidebar.slider('Años de PER histórico', 5, 15, 10)
 run = st.sidebar.button('Analizar')
 run_tests = st.sidebar.button('Ejecutar diagnóstico')
 
@@ -296,37 +324,36 @@ if run:
             v_base = dcf_intrinsic_from_base(metrics['base_fcf'], g_base, metrics['shares'], metrics['cash'], metrics['debt'])
             v_pes = dcf_intrinsic_from_base(metrics['base_fcf'], g_pes, metrics['shares'], metrics['cash'], metrics['debt'])
             v_cus = dcf_intrinsic_from_base(metrics['base_fcf'], g_cus, metrics['shares'], metrics['cash'], metrics['debt'])
-            pe_hist = historical_pe_series(ydata['financials'], ydata['history'])
-            peer_growth = aggregate_peer_growth(ticker, peers)
-            company_rev_growth = metrics['revenue'].tail(5).pct_change().dropna() if len(metrics['revenue']) else pd.Series(dtype=float)
-            company_rev_growth.index = [str(x.year) for x in company_rev_growth.index]
+            pe_hist = historical_pe_series(ydata['financials'], ydata['history'], max_years=per_years)
+            growth_sales_pct = metrics['growth_sales'] * 100 if np.isfinite(metrics['growth_sales']) else None
+            per_teorico = growth_sales_pct * 2 + 8 if growth_sales_pct is not None else None
             base_path = intrinsic_path(metrics['base_fcf'], g_base, metrics['shares'], metrics['cash'], metrics['debt'])
             pes_path = intrinsic_path(metrics['base_fcf'], g_pes, metrics['shares'], metrics['cash'], metrics['debt'])
             cus_path = intrinsic_path(metrics['base_fcf'], g_cus, metrics['shares'], metrics['cash'], metrics['debt'])
+            mt_df = metrics_table_from_2020(ydata)
+
             st.subheader(name)
             st.write(f"Industria Finnhub: {industry} | País: {country} | Bolsa: {exchange}")
-            st.caption(f"Peers detectados por Finnhub: {', '.join(peers[:6]) if peers else 'No disponibles'}")
+            st.caption(f"Peers detectados por Finnhub: {', '.join(peers) if peers else 'No disponibles'}")
+
             c1, c2, c3, c4 = st.columns(4)
             c1.metric('Precio actual', f"{metrics['price']:.2f} {currency}")
             c2.metric('Valor base', f"{v_base:.2f} {currency}" if np.isfinite(v_base) else 'No disp.')
             c3.metric('Valor pesimista', f"{v_pes:.2f} {currency}" if np.isfinite(v_pes) else 'No disp.')
             c4.metric('Valor personalizado', f"{v_cus:.2f} {currency}" if np.isfinite(v_cus) else 'No disp.')
+
             st.subheader('PER histórico real')
             fig1 = go.Figure()
             if len(pe_hist):
                 fig1.add_trace(go.Scatter(x=pe_hist.index.astype(str), y=pe_hist.values, mode='lines+markers', name='PER empresa'))
-            fig1.update_layout(height=330, xaxis_title='Año', yaxis_title='PER')
+            fig1.update_layout(height=360, xaxis_title='Año', yaxis_title='PER')
             st.plotly_chart(fig1, use_container_width=True)
-            st.caption(f"Forward PER actual: {metrics['forward_pe'] if np.isfinite(metrics['forward_pe']) else 'No disponible'}")
-            st.subheader('Crecimiento internacional: empresa vs peers')
-            fig2 = go.Figure()
-            if len(company_rev_growth):
-                fig2.add_trace(go.Bar(x=company_rev_growth.index, y=company_rev_growth.values * 100, name='Empresa'))
-            if len(peer_growth):
-                fig2.add_trace(go.Scatter(x=list(peer_growth.index), y=peer_growth.values * 100, mode='lines+markers', name='Peers medianos'))
-            fig2.update_layout(height=340, xaxis_title='Año', yaxis_title='Crecimiento ventas (%)')
-            st.plotly_chart(fig2, use_container_width=True)
-            st.caption('La estructura queda lista para evolucionar de peers a series sectoriales puras si incorporas una fuente adicional agregada internacional.')
+            forward_pe_str = f"{metrics['forward_pe']:.2f}" if np.isfinite(metrics['forward_pe']) else 'No disponible'
+            if per_teorico is not None:
+                st.caption(f"Forward PER actual: {forward_pe_str} | PER teórico (2× crecimiento ventas + 8): {per_teorico:.2f}")
+            else:
+                st.caption(f"Forward PER actual: {forward_pe_str} | PER teórico: No disponible")
+
             st.subheader('Precio vs valor relativo a 5 años')
             fig3 = go.Figure()
             years = list(base_path.index)
@@ -336,10 +363,19 @@ if run:
             fig3.add_trace(go.Scatter(x=years, y=cus_path.values, mode='lines+markers', name='Valor personalizado'))
             fig3.update_layout(height=380, xaxis_title='Años desde hoy', yaxis_title=f'Valor ({currency})')
             st.plotly_chart(fig3, use_container_width=True)
+
+            st.subheader('Métricas clave desde 2020')
+            if not mt_df.empty:
+                display_df = mt_df.copy()
+                for col in display_df.columns:
+                    display_df[col] = display_df[col].apply(lambda x: round(x, 2) if pd.notna(x) else x)
+                st.dataframe(display_df, use_container_width=True)
+            else:
+                st.caption('No hay datos suficientes para construir la tabla desde 2020.')
+
             st.subheader('Arquitectura de datos')
             st.markdown('- Fuente principal internacional: **Finnhub** para perfil e identificación de peers.')
-            st.markdown('- Crecimiento internacional agregado: **mediana de peers detectados por Finnhub**, cacheada en SQLite.')
-            st.markdown('- Precios, EPS y estados financieros: **Yahoo Finance / yfinance**.')
+            st.markdown('- Precios, EPS y estados financieros: **Yahoo Finance / yfinance** con caché local de 1 hora.')
             st.markdown(f'- Base local: **SQLite ({DB_PATH})**.')
             st.markdown('- Credencial: API key desde **Streamlit secrets** o input lateral dentro de la propia app.')
         except Exception as e:
